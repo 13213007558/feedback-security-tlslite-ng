@@ -21,7 +21,8 @@ from .utils.tackwrapper import *
 from .utils.deprecations import deprecated_attrs, deprecated_params
 from .extensions import *
 from .utils.format_output import none_as_unknown
-from .utils.compression import compression_algo_impls
+from .utils.compression import compression_algo_impls, \
+        MAX_DECOMPRESSED_CERTIFICATE_SIZE, zlib_decompress_limited
 
 
 class RecordHeader(object):
@@ -2507,31 +2508,38 @@ class CompressedCertificate(Certificate):
         if not isinstance(compressed_msg, bytes):
             compressed_msg = bytes(compressed_msg)
 
+        # The peer-provided expected_length is attacker controlled, it is only
+        # used to verify the decompressed output, never as the memory budget.
+        # The trusted cap is enforced while the stream is being expanded so
+        # that an oversized output is rejected before it gets allocated.
+        max_output_size = MAX_DECOMPRESSED_CERTIFICATE_SIZE
         try:
             if self.compression_algo == CertificateCompressionAlgorithm.zlib:
-                decompressed_msg = zlib.decompress(
-                    compressed_msg, 15, expected_length)
+                decompressed_msg = zlib_decompress_limited(
+                    compressed_msg, max_output_size)
             elif self.compression_algo == \
                     CertificateCompressionAlgorithm.brotli:
                 if compression_algo_impls["brotli_accepts_limit"]:
                     decompressed_msg = \
                         compression_algo_impls["brotli_decompress"](
-                            compressed_msg, expected_length)
+                            compressed_msg, max_output_size)
                 else:
                     decompressed_msg = \
-                        compression_algo_impls["brotli_decompress"](
-                            compressed_msg)
+                        self._brotli_decompress_limited(
+                            compressed_msg, max_output_size)
             else:
                 assert self.compression_algo == \
                     CertificateCompressionAlgorithm.zstd
                 if compression_algo_impls["zstd_accepts_limit"]:
                     decompressed_msg = \
                         compression_algo_impls["zstd_decompress"](
-                            compressed_msg, expected_length)
+                            compressed_msg, max_output_size)
                 else:
                     decompressed_msg = \
-                        compression_algo_impls["zstd_decompress"](
-                            compressed_msg)
+                        self._zstd_decompress_limited(
+                            compressed_msg, max_output_size)
+        except (BadCertificateError, TLSIllegalParameterException):
+            raise
         except Exception:
             raise BadCertificateError("Error on decompressing the message.")
 
@@ -2540,6 +2548,63 @@ class CompressedCertificate(Certificate):
                 "Decompressed message doesn't much length.")
 
         return decompressed_msg
+
+    @staticmethod
+    def _brotli_decompress_limited(compressed_msg, max_output_size):
+        """Decompress a brotli stream with a hard output cap.
+
+        Used with backends whose ``decompress`` does not accept an output
+        limit. The stream is fed through the streaming decoder in bounded
+        input chunks so the output buffer can't grow past the cap.
+        """
+        try:
+            import brotli as _brotli
+        except ImportError:
+            raise BadCertificateError(
+                "Brotli decompression implementation is not available.")
+        decoder = _brotli.Decompressor()
+        output = bytearray()
+        chunk_size = 16384
+        for offset in range(0, len(compressed_msg), chunk_size):
+            produced = decoder.process(
+                compressed_msg[offset:offset + chunk_size])
+            output += produced
+            if len(output) > max_output_size:
+                raise BufferError(
+                    "Decompressed certificate exceeds the maximum allowed "
+                    "size")
+        if not decoder.is_finished():
+            raise Exception("Truncated brotli compressed certificate stream")
+        if getattr(decoder, "unused_data", b""):
+            raise Exception("Trailing data after brotli stream")
+        return output
+
+    @staticmethod
+    def _zstd_decompress_limited(compressed_msg, max_output_size):
+        """Decompress a zstd stream with a hard output cap.
+
+        Used with backends whose ``decompress`` does not accept an output
+        limit. The streaming decoder is given the trusted cap as the size of
+        the output buffer so an oversized frame fails while it is being
+        expanded instead of after full allocation.
+        """
+        try:
+            import zstd as _zstd
+        except ImportError:
+            raise BadCertificateError(
+                "Zstd decompression implementation is not available.")
+        decoder = _zstd.ZstdDecompressor()
+        # ``size`` bounds the output buffer the decoder is allowed to fill,
+        # so a frame larger than the trusted cap fails while it is being
+        # expanded instead of after full allocation
+        produced = decoder.write(
+            compressed_msg, size=max_output_size + 1)
+        output = bytearray()
+        output += produced
+        if len(output) > max_output_size:
+            raise BufferError(
+                "Decompressed certificate exceeds the maximum allowed size")
+        return output
 
     def create(self, compression_algo, cert_chain, context=b'', ext=None):
         """Create CompressedCertificate message."""
@@ -2561,6 +2626,15 @@ class CompressedCertificate(Certificate):
         if len(compressed_msg) == 0:
             raise DecodeError("Empty compress certificate message")
 
+        # The advertised uncompressed length is not trustworthy, but reject
+        # an obviously oversized claim up front so we don't even start
+        # decompressing it.
+        if expected_length > MAX_DECOMPRESSED_CERTIFICATE_SIZE:
+            raise BadCertificateError(
+                "Advertised uncompressed certificate length {0} exceeds the "
+                "maximum allowed size of {1}".format(
+                    expected_length, MAX_DECOMPRESSED_CERTIFICATE_SIZE))
+
         p.stopLengthCheck()
         certificate_msg = self._decompress(compressed_msg, expected_length)
 
@@ -2568,7 +2642,16 @@ class CompressedCertificate(Certificate):
         writer.add(expected_length, 3)
         writer.bytes += certificate_msg
         parser = Parser(writer.bytes)
+        # the decompressed payload is framed as a single Certificate message:
+        # a 3-byte length prefix followed by exactly that many bytes, so the
+        # parser has to consume the whole buffer with nothing left over
         super(CompressedCertificate, self).parse(parser)
+
+        # the whole decompressed payload has to be a single Certificate
+        # message, trailing bytes are a protocol violation
+        if parser.index != len(parser.bytes):
+            raise BadCertificateError(
+                "Trailing data after the decompressed Certificate message")
 
         if not self._compressed_msg:
             certificate_msg = super(CompressedCertificate, self).write()

@@ -41,7 +41,8 @@ from tlslite.extensions import SNIExtension, ClientCertTypeExtension, \
 from tlslite.errors import TLSInternalError, TLSIllegalParameterException
 from tlslite.x509 import X509
 from tlslite.x509certchain import X509CertChain
-from tlslite.utils.compression import compression_algo_impls
+from tlslite.utils.compression import compression_algo_impls, \
+        MAX_DECOMPRESSED_CERTIFICATE_SIZE, DECOMPRESSION_CHUNK_SIZE
 from tlslite.utils.brotlidecpy import decompress as custom_decompress
 
 
@@ -4197,6 +4198,273 @@ class TestCompressedCertificate(unittest.TestCase):
 
         self.assertIn("Error on decompressing the message.",
                       str(e.exception))
+
+    @staticmethod
+    def _compressed_certificate(algo, cert_chain):
+        """Build a parsed CompressedCertificate from a real cert chain."""
+        cc = CompressedCertificate(CertificateType.x509).create(
+            algo, cert_chain)
+        return cc
+
+    @staticmethod
+    def _wire_payload(algo, declared_length, compressed_payload):
+        """Build the on-wire CompressedCertificate payload (no HS header)."""
+        writer = Writer()
+        writer.add(2 + 3 + 3 + len(compressed_payload), 3)
+        writer.add(algo, 2)
+        writer.add(declared_length, 3)
+        writer.add(len(compressed_payload), 3)
+        writer.bytes += compressed_payload
+        return writer.bytes
+
+    def _real_cert_chain(self, count=2):
+        cert = X509().parse(srv_raw_certificate)
+        return X509CertChain([cert] * count)
+
+    def test_parse_real_multi_cert_chain_round_trip(self):
+        for count in (1, 2, 3):
+            chain = self._real_cert_chain(count)
+            cc = self._compressed_certificate(
+                CertificateCompressionAlgorithm.zlib, chain)
+            wire = cc.write()
+
+            parsed = CompressedCertificate(CertificateType.x509).parse(
+                Parser(bytearray(wire[1:])))
+
+            self.assertEqual(parsed.cert_chain.getNumCerts(), count)
+            self.assertEqual(
+                parsed._uncompressed_msg_len, cc._uncompressed_msg_len)
+
+    def test_parse_declared_length_above_cap_rejected_up_front(self):
+        huge_length = MAX_DECOMPRESSED_CERTIFICATE_SIZE + 1
+        # tiny, perfectly valid zlib stream, so only the declared length is
+        # what makes the message invalid
+        import zlib as _zlib
+        payload = _zlib.compress(b"")
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib, huge_length, payload)
+
+        with self.assertRaises(BadCertificateError) as e:
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+        self.assertIn("exceeds the maximum allowed size", str(e.exception))
+
+    def test_parse_bomb_with_small_declared_length_is_bounded(self):
+        # a few KiB that would expand to tens of MiB while the peer claims a
+        # tiny, innocent uncompressed length
+        import zlib as _zlib
+        bomb = _zlib.compress(b"\x00" * (32 * 1024 * 1024), 9)
+        self.assertLess(len(bomb), 64 * 1024)
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib, 4, bomb)
+
+        observed = []
+        import tlslite.messages as _messages
+        original = _messages.zlib_decompress_limited
+
+        def observing_helper(compressed_msg, max_output_size, observer=None):
+            return original(
+                compressed_msg, max_output_size,
+                observer=observed.append if observer is None else observer)
+
+        with mock.patch.object(
+                _messages, "zlib_decompress_limited", observing_helper):
+            with self.assertRaises(BadCertificateError):
+                CompressedCertificate(CertificateType.x509).parse(
+                    Parser(wire))
+
+        # expansion stopped at the trusted cap, never reached the 32 MiB
+        self.assertTrue(observed)
+        self.assertLessEqual(
+            max(observed),
+            MAX_DECOMPRESSED_CERTIFICATE_SIZE + DECOMPRESSION_CHUNK_SIZE)
+
+    def test_parse_truncated_zlib_stream_rejected(self):
+        import zlib as _zlib
+        cc = self._compressed_certificate(
+            CertificateCompressionAlgorithm.zlib, self._real_cert_chain())
+        truncated = bytes(cc._compressed_msg)[:-4]
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib,
+            cc._uncompressed_msg_len, truncated)
+
+        with self.assertRaises(BadCertificateError):
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+    def test_parse_trailing_bytes_in_zlib_stream_rejected(self):
+        cc = self._compressed_certificate(
+            CertificateCompressionAlgorithm.zlib, self._real_cert_chain())
+        with_tail = bytes(cc._compressed_msg) + b"trailing"
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib,
+            cc._uncompressed_msg_len, with_tail)
+
+        with self.assertRaises(BadCertificateError):
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+    def test_parse_output_shorter_than_declared_rejected(self):
+        cc = self._compressed_certificate(
+            CertificateCompressionAlgorithm.zlib, self._real_cert_chain())
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib,
+            cc._uncompressed_msg_len + 100, cc._compressed_msg)
+
+        with self.assertRaises(BadCertificateError) as e:
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+        self.assertIn("doesn't much length", str(e.exception))
+
+    def test_parse_output_longer_than_declared_rejected(self):
+        cc = self._compressed_certificate(
+            CertificateCompressionAlgorithm.zlib, self._real_cert_chain())
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib,
+            cc._uncompressed_msg_len - 100, cc._compressed_msg)
+
+        with self.assertRaises(BadCertificateError) as e:
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+        self.assertIn("doesn't much length", str(e.exception))
+
+    def test_parse_trailing_bytes_in_certificate_payload_rejected(self):
+        import zlib as _zlib
+        cc = self._compressed_certificate(
+            CertificateCompressionAlgorithm.zlib, self._real_cert_chain())
+        body = _zlib.decompress(bytes(cc._compressed_msg))
+        # valid zlib stream, but the decompressed Certificate framing carries
+        # bytes that don't belong to it
+        poisoned = _zlib.compress(body + b"\xde\xad\xbe\xef")
+        wire = self._wire_payload(
+            CertificateCompressionAlgorithm.zlib, len(body) + 4, poisoned)
+
+        with self.assertRaises((BadCertificateError, DecodeError)):
+            CompressedCertificate(CertificateType.x509).parse(Parser(wire))
+
+    def test_parse_unsupported_algorithm_rejected(self):
+        import zlib as _zlib
+        payload = _zlib.compress(b"")
+        writer = Writer()
+        writer.add(2 + 3 + 3 + len(payload), 3)
+        writer.add(99, 2)  # unknown/unsupported algorithm id
+        writer.add(0, 3)
+        writer.add(len(payload), 3)
+        writer.bytes += payload
+
+        with self.assertRaises(TLSIllegalParameterException):
+            CompressedCertificate(CertificateType.x509).parse(
+                Parser(writer.bytes))
+
+    def test_decompress_uses_trusted_cap_not_declared_length(self):
+        # the declared length must never be passed as the budget to a
+        # decompression backend; the backend always receives the trusted cap
+        import zlib as _zlib
+        import tlslite.messages as _messages
+        import tlslite.utils.compression as _compression
+        cc = CompressedCertificate(CertificateType.x509)
+        cc.compression_algo = CertificateCompressionAlgorithm.zlib
+        msg = b"z" * 5000
+        compressed = _zlib.compress(msg)
+
+        with mock.patch.object(
+                _messages, "zlib_decompress_limited",
+                wraps=_compression.zlib_decompress_limited) as wrapped:
+            cc._decompress(compressed, len(msg))
+
+        # backend receives the trusted cap, not the peer-declared length
+        self.assertEqual(wrapped.call_args[0][1],
+                         MAX_DECOMPRESSED_CERTIFICATE_SIZE)
+
+    def _assert_optional_backend_gets_trusted_cap(self, algo_name,
+                                                  accepts_limit, helper_name):
+        # shared check for brotli/zstd: regardless of whether the installed
+        # backend natively accepts an output limit, the budget it sees is the
+        # trusted cap rather than the attacker-declared length
+        import tlslite.messages as _messages
+        algo = getattr(CertificateCompressionAlgorithm, algo_name)
+        captured = {}
+
+        def limited_backend(data, limit=None):
+            captured["limit"] = limit
+            return bytearray(b"")
+
+        stub_impls = dict(_messages.compression_algo_impls)
+        stub_impls[algo_name + "_decompress"] = limited_backend
+        stub_impls[algo_name + "_accepts_limit"] = accepts_limit
+
+        cc = CompressedCertificate(CertificateType.x509)
+        cc.compression_algo = algo
+        with mock.patch.object(
+                _messages, "compression_algo_impls", stub_impls):
+            if accepts_limit:
+                cc._decompress(b"stub", 0)
+                self.assertEqual(captured["limit"],
+                                 MAX_DECOMPRESSED_CERTIFICATE_SIZE)
+            else:
+                with mock.patch.object(
+                        cc, helper_name,
+                        wraps=getattr(cc, helper_name)) as wrapped:
+                    cc._decompress(b"stub", 0)
+                    self.assertEqual(wrapped.call_args[0][1],
+                                     MAX_DECOMPRESSED_CERTIFICATE_SIZE)
+
+    def test_brotli_backend_gets_trusted_cap(self):
+        # native-limit brotli backend (e.g. the vendored pure-python decoder)
+        self._assert_optional_backend_gets_trusted_cap(
+            "brotli", True, "_brotli_decompress_limited")
+
+    def test_zstd_native_limit_backend_gets_trusted_cap(self):
+        self._assert_optional_backend_gets_trusted_cap(
+            "zstd", True, "_zstd_decompress_limited")
+
+    def test_brotli_pure_python_empty_stream_round_trip(self):
+        # the vendored pure-python decoder is the brotli backend available
+        # without third-party dependencies
+        if not (
+                self._brotli_is_pure_python()
+                and compression_algo_impls["brotli_decompress"]):
+            self.skipTest("requires the vendored pure-python brotli decoder")
+        cc = CompressedCertificate(CertificateType.x509)
+        cc.compression_algo = CertificateCompressionAlgorithm.brotli
+        # 0x06 is the canonical empty brotli stream
+        decompressed = cc._decompress(bytearray(b"\x06"), 0)
+        self.assertEqual(bytes(decompressed), b"")
+
+    def test_brotli_pure_python_trailing_data_rejected(self):
+        if not (
+                self._brotli_is_pure_python()
+                and compression_algo_impls["brotli_decompress"]):
+            self.skipTest("requires the vendored pure-python brotli decoder")
+        cc = CompressedCertificate(CertificateType.x509)
+        cc.compression_algo = CertificateCompressionAlgorithm.brotli
+        with self.assertRaises(BadCertificateError):
+            cc._decompress(bytearray(b"\x06GARBAGE"), 0)
+
+    def test_brotli_pure_python_malformed_stream_rejected(self):
+        if not (
+                self._brotli_is_pure_python()
+                and compression_algo_impls["brotli_decompress"]):
+            self.skipTest("requires the vendored pure-python brotli decoder")
+        cc = CompressedCertificate(CertificateType.x509)
+        cc.compression_algo = CertificateCompressionAlgorithm.brotli
+        with self.assertRaises(BadCertificateError):
+            cc._decompress(bytearray(b"\x00"), 0)
+
+    def test_brotli_pure_python_buffer_limit_enforced(self):
+        if not (
+                self._brotli_is_pure_python()
+                and compression_algo_impls["brotli_decompress"]):
+            self.skipTest("requires the vendored pure-python brotli decoder")
+        decoder = compression_algo_impls["brotli_decompress"]
+        # empty output honours a zero limit
+        self.assertEqual(bytes(decoder(b"\x06", 0)), b"")
+        with self.assertRaises(BufferError):
+            decoder(b"\x06", -1)
+
+    @staticmethod
+    def _brotli_is_pure_python():
+        from tlslite.utils import brotlidecpy
+        return compression_algo_impls["brotli_decompress"] is \
+            brotlidecpy.decompress
 
 
 if __name__ == '__main__':

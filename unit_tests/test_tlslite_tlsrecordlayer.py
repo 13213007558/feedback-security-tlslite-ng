@@ -17,21 +17,23 @@ except ImportError:
 
 import socket
 import errno
+import hashlib
 from tlslite.tlsrecordlayer import TLSRecordLayer
 from tlslite.messages import Message, ClientHello, ServerHello, Certificate, \
         ServerHelloDone, ClientKeyExchange, ChangeCipherSpec, Finished, \
-        RecordHeader3
+        RecordHeader3, CompressedCertificate
 from tlslite.errors import TLSAbruptCloseError, TLSLocalAlert, \
         TLSAbruptCloseError, TLSInternalError, TLSClosedConnectionError
 from tlslite.extensions import TLSExtension
 from tlslite.constants import ContentType, HandshakeType, CipherSuite, \
-        CertificateType
+        CertificateType, CertificateCompressionAlgorithm, AlertDescription
 from tlslite.mathtls import PRF_1_2, calc_key
 from tlslite.x509 import X509
 from tlslite.x509certchain import X509CertChain
 from tlslite.utils.keyfactory import parsePEMKey
 from tlslite.utils.codec import Parser
 from unit_tests.mocksock import MockSocket
+from unit_tests.test_tlslite_messages import srv_raw_certificate
 
 class TestTLSRecordLayer(unittest.TestCase):
     def test___init__(self):
@@ -1038,3 +1040,97 @@ class TestTLSRecordLayer(unittest.TestCase):
 
         record_layer.close()
 
+
+    def _compressed_certificate_record(self, cert_count=2):
+        """Build a TLS record carrying a real CompressedCertificate message."""
+        cert = X509().parse(srv_raw_certificate)
+        chain = X509CertChain([cert] * cert_count)
+        message = CompressedCertificate(CertificateType.x509).create(
+            CertificateCompressionAlgorithm.zlib, chain)
+        handshake_bytes = message.write()
+        record = bytearray(
+            bytes([ContentType.handshake]) + b"\x03\x03" +
+            len(handshake_bytes).to_bytes(2, "big") +
+            bytes(handshake_bytes))
+        return record, handshake_bytes
+
+    @staticmethod
+    def _run_generator(generator):
+        """Drive a tlslite generator until it returns its message."""
+        message = None
+        for result in generator:
+            if result not in (0, 1):
+                message = result
+                break
+        return message
+
+    def test__getMsg_compressed_certificate_hashes_wire_bytes(self):
+        # RFC 8879: the transcript (and therefore CertificateVerify) is
+        # computed over the exact on-wire CompressedCertificate handshake
+        # bytes, never over a decompress-then-reserialise representation
+        record, handshake_bytes = self._compressed_certificate_record()
+        record_layer = TLSRecordLayer(MockSocket(record))
+        record_layer.version = (3, 4)
+
+        generator = record_layer._getMsg(
+            ContentType.handshake,
+            (HandshakeType.certificate,
+             HandshakeType.compressed_certificate),
+            CertificateType.x509)
+        message = self._run_generator(generator)
+
+        self.assertIsInstance(message, CompressedCertificate)
+        self.assertEqual(message.cert_chain.getNumCerts(), 2)
+
+        transcript = record_layer._handshake_hash.digest("intrinsic")
+        self.assertEqual(bytes(transcript), bytes(handshake_bytes))
+
+        expected_digest = hashlib.sha256(bytes(handshake_bytes)).digest()
+        self.assertEqual(
+            record_layer._handshake_hash.digest("sha256"), expected_digest)
+
+    def test__getMsg_compressed_certificate_bomb_does_not_pollute_transcript(
+            self):
+        # a rejected compressed certificate must not leave decompressed or
+        # re-serialised bytes in the handshake transcript; the only hashed
+        # bytes are the raw on-wire message consumed before parsing. The bomb
+        # stays small on the wire (so it passes the record size limit) but
+        # expands past the trusted decompression cap
+        import zlib
+        bomb = zlib.compress(b"\x00" * (2 * 1024 * 1024), 9)
+        self.assertLess(8 + len(bomb), 16384)
+        from tlslite.utils.codec import Writer
+        writer = Writer()
+        writer.add(2 + 3 + 3 + len(bomb), 3)
+        writer.add(CertificateCompressionAlgorithm.zlib, 2)
+        writer.add(4, 3)  # peer lies about a tiny uncompressed length
+        writer.add(len(bomb), 3)
+        writer.bytes += bomb
+        payload = writer.bytes
+        handshake_bytes = bytearray(
+            bytes([HandshakeType.compressed_certificate]) + bytes(payload))
+        record = bytearray(
+            bytes([ContentType.handshake]) + b"\x03\x03" +
+            len(handshake_bytes).to_bytes(2, "big") +
+            bytes(handshake_bytes))
+
+        record_layer = TLSRecordLayer(MockSocket(record))
+        record_layer.version = (3, 4)
+
+        generator = record_layer._getMsg(
+            ContentType.handshake,
+            (HandshakeType.certificate,
+             HandshakeType.compressed_certificate),
+            CertificateType.x509)
+        with self.assertRaises(TLSLocalAlert) as alert:
+            for result in generator:
+                if result not in (0, 1):
+                    break
+
+        self.assertEqual(alert.exception.description,
+                         AlertDescription.bad_certificate)
+        # the transcript still contains the wire bytes only, no decompressed
+        # expansion of the 2 MiB bomb
+        transcript = record_layer._handshake_hash.digest("intrinsic")
+        self.assertEqual(bytes(transcript), bytes(handshake_bytes))
+        self.assertLess(len(transcript), 16384)

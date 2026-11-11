@@ -451,6 +451,12 @@ def brotli_decompress_buffer(input_buffer, buffer_limit=None):
             continue
 
         if len(output_buffer) < (pos + meta_block_remaining_len):
+            if buffer_limit is not None and \
+                    pos + meta_block_remaining_len > buffer_limit:
+                raise BufferError(
+                    "Trying to obtain buffer larger than {0}".format(
+                        buffer_limit)
+                )
             output_buffer.extend(bytearray([0] * meta_block_remaining_len))
 
         if is_uncompressed:
@@ -643,4 +649,11 @@ def brotli_decompress_buffer(input_buffer, buffer_limit=None):
                     output_buffer[pos] = output_buffer[pos - distance]
                     pos += 1
                     meta_block_remaining_len -= 1
+
+    # the whole input has to belong to the brotli stream, reject trailing
+    # bytes instead of silently ignoring them (brotli is a bit stream so only
+    # zero padding bits are allowed inside the last consumed byte)
+    trailing_bytes = br.buf_len_ - br.pos_
+    if trailing_bytes > 1 or (trailing_bytes == 1 and br.bit_pos_ == 0):
+        raise Exception('Trailing data after brotli stream')
     return output_buffer
