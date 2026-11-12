@@ -32,7 +32,7 @@ from .messages import *
 from .mathtls import *
 from .utils.ecc import curve_name_to_hash_name
 from .handshakesettings import HandshakeSettings, KNOWN_VERSIONS, \
-        CURVE_ALIASES, DC_VALID_TIME
+        CURVE_ALIASES, DC_VALID_TIME, ResumptionTicket
 from .handshakehashes import HandshakeHashes
 from .utils.tackwrapper import *
 from .utils.deprecations import deprecated_params
@@ -2364,7 +2364,7 @@ class TLSConnection(TLSRecordLayer):
         for result in self._serverGetClientHello(settings, privateKey,
                                                  cert_chain,
                                                  verifierDB, sessionCache,
-                                                 anon, alpn, sni):
+                                                 anon, alpn, sni, reqCert):
             if result in (0,1): yield result
             elif result == None:
                 self._handshakeDone(resumed=True)
@@ -2809,6 +2809,40 @@ class TLSConnection(TLSRecordLayer):
             for result in self._queue_flush():
                 yield result
 
+    def _check_resumption_admission(self, settings, ticket, req_cert):
+        """Ask the application policy whether a ticket may resume.
+
+        Runs only when ``settings.resumption_admission_callback`` is set.
+        The ticket has already been decrypted and authenticated at this point,
+        but the resumption was not committed, so a ``False`` verdict can still
+        be turned into a full handshake. An exception from the callback is
+        propagated to the caller, which aborts the handshake; it is never
+        treated as an implicit allow.
+
+        :rtype: bool
+        :returns: True when the resumption is admitted (or no callback was
+            configured), False when the application rejected the ticket
+        """
+        callback = settings.resumption_admission_callback
+        if not callback:
+            return True
+
+        now = time.time()
+        age = now - ticket.creation_time
+        info = ResumptionTicket(
+            protocol_version=ticket.protocol_version,
+            cipher_suite=ticket.cipher_suite,
+            client_cert_chain=ticket.client_cert_chain,
+            server_name=ticket.server_name.decode("utf-8")
+            if ticket.server_name else "",
+            creation_time=ticket.creation_time,
+            age=age,
+            expired=age >= settings.ticketLifetime,
+            client_certificate_required=bool(req_cert),
+            extended_master_secret=bool(ticket.extended_master_secret),
+            encrypt_then_mac=bool(ticket.encrypt_then_mac))
+        return bool(callback(info))
+
     def _tryDecrypt(self, settings, identity=None, ticket=None):
         if not settings.ticketKeys:
             return None, None
@@ -2927,6 +2961,26 @@ class TLSConnection(TLSRecordLayer):
                 psk_hash = match[0][2] if len(match[0]) > 2 else 'sha256'
                 if psk_hash != prf_name:
                     continue
+
+                # application admission policy for ticket based resumption;
+                # external (statically configured) PSKs have no ticket, so the
+                # callback applies only to tickets issued by this server
+                if ticket:
+                    try:
+                        admitted = self._check_resumption_admission(
+                            settings, ticket, reqCert)
+                    except Exception as e:
+                        for result in self._sendError(
+                                AlertDescription.internal_error,
+                                "Session resumption admission callback "
+                                "failed: {0}".format(e)):
+                            yield result
+                        raise AssertionError("_sendError did not raise")
+                    if not admitted:
+                        # reject this identity, keep looking for another one;
+                        # with no usable PSK left the handshake continues as a
+                        # full handshake below
+                        continue
 
                 psk = match[0][1]
                 selected_psk = i
@@ -3402,14 +3456,24 @@ class TLSConnection(TLSRecordLayer):
 
         yield "finished"
 
-    def _ticket_to_session(self, settings, ticket_ext):
+    def _ticket_to_session(self, settings, ticket_ext, req_cert):
         if not ticket_ext.ticket:
             return None
         _, ticket = self._tryDecrypt(settings, ticket=ticket_ext.ticket)
         if not ticket:
             return None
 
-        if ticket.creation_time + settings.ticketLifetime < time.time():
+        # check freshness before the application policy so that the callback
+        # is told whether the ticket is expired; expired tickets never resume
+        expired = ticket.creation_time + settings.ticketLifetime < time.time()
+
+        # run the application admission policy before the resumption is
+        # committed; a False verdict makes the caller fall back to a full
+        # handshake while a callback exception aborts the handshake
+        if not self._check_resumption_admission(settings, ticket, req_cert):
+            return None
+
+        if expired:
             return None
 
         session = Session()
@@ -3431,7 +3495,7 @@ class TLSConnection(TLSRecordLayer):
 
     def _serverGetClientHello(self, settings, private_key, cert_chain,
                               verifierDB,
-                              sessionCache, anon, alpn, sni):
+                              sessionCache, anon, alpn, sni, reqCert):
         # Tentatively set version to most-desirable version, so if an error
         # occurs parsing the ClientHello, this will be the version we'll use
         # for the error alert
@@ -3901,7 +3965,19 @@ class TLSConnection(TLSRecordLayer):
             # new Client Hello
             try:
                 if ticket_ext:
-                    session = self._ticket_to_session(settings, ticket_ext)
+                    try:
+                        session = self._ticket_to_session(
+                            settings, ticket_ext, reqCert)
+                    except Exception as e:
+                        # admission callback failure: do not resume and do
+                        # not treat the error as an implicit allow, signal a
+                        # fatal alert instead
+                        for result in self._sendError(
+                                AlertDescription.internal_error,
+                                "Session resumption admission callback "
+                                "failed: {0}".format(e)):
+                            yield result
+                        raise AssertionError("_sendError did not raise")
                     # client MAY send a random session_id to easily tell
                     # if the session is resumed, for that server has to
                     # echo the session_ID back

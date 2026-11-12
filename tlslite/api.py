@@ -11,7 +11,7 @@ __version__ = "0.9.0b2"
 from .constants import AlertLevel, AlertDescription, Fault
 from .errors import *
 from .checker import Checker
-from .handshakesettings import HandshakeSettings
+from .handshakesettings import HandshakeSettings, ResumptionTicket
 from .session import Session
 from .sessioncache import SessionCache
 from .tlsconnection import TLSConnection

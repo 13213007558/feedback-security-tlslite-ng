@@ -106,6 +106,95 @@ DELEGETED_CREDENTIAL_FORBIDDEN_ALG = [
 DC_VALID_TIME = 604800
 
 
+class ResumptionTicket(object):
+    """
+    Identity information saved in a session ticket presented for resumption.
+
+    An instance of this class is the single argument of the
+    :attr:`HandshakeSettings.resumption_admission_callback`. It describes the
+    identity that was saved in the ticket when the original full handshake
+    completed, together with the admission-relevant handshake parameters in
+    effect while the ticket is being evaluated. All values come from the
+    decrypted, integrity-protected ticket and from the current server
+    configuration; no resumption key material is exposed.
+
+    The callback runs on the server side, after the ticket has been
+    successfully decrypted but before the resumption is accepted, i.e. before
+    the server commits to the resumed session (no resumption ServerHello or
+    Finished is sent at that point). Returning ``False`` makes the server
+    ignore the ticket and continue with a full handshake instead. Raising an
+    exception aborts the handshake with a fatal alert.
+
+    :vartype protocol_version: tuple
+    :ivar protocol_version: TLS version negotiated by the original connection,
+        e.g. ``(3, 3)`` for TLS 1.2 or ``(3, 4)`` for TLS 1.3
+
+    :vartype cipher_suite: int
+    :ivar cipher_suite: numerical ID of the cipher suite negotiated by the
+        original connection (see :class:`~tlslite.constants.CipherSuite`)
+
+    :vartype client_cert_chain: ~tlslite.x509certchain.X509CertChain
+    :ivar client_cert_chain: client certificate chain saved in the ticket,
+        or ``None`` for an anonymous ticket (one issued without client
+        certificate authentication)
+
+    :vartype server_name: str
+    :ivar server_name: SNI host name saved in the ticket, empty string if the
+        original connection did not use SNI
+
+    :vartype creation_time: int
+    :ivar creation_time: Unix time in seconds at which the ticket was issued
+
+    :vartype age: float
+    :ivar age: age of the ticket in seconds at the time of the check
+
+    :vartype expired: bool
+    :ivar expired: ``True`` if the ticket is older than the configured
+        :attr:`~HandshakeSettings.ticketLifetime`
+
+    :vartype client_certificate_required: bool
+    :ivar client_certificate_required: current server configuration, value of
+        the ``reqCert`` parameter of the server handshake; ``True`` means the
+        server currently requests (or, on resumption, would rely on) a client
+        certificate
+
+    :vartype extended_master_secret: bool
+    :ivar extended_master_secret: whether the original connection used the
+        extended master secret extension
+
+    :vartype encrypt_then_mac: bool
+    :ivar encrypt_then_mac: whether the original connection used the
+        encrypt-then-MAC extension
+    """
+
+    def __init__(self, protocol_version, cipher_suite, client_cert_chain,
+                 server_name, creation_time, age, expired,
+                 client_certificate_required, extended_master_secret,
+                 encrypt_then_mac):
+        """Initialise the resumption ticket description."""
+        self.protocol_version = protocol_version
+        self.cipher_suite = cipher_suite
+        self.client_cert_chain = client_cert_chain
+        self.server_name = server_name
+        self.creation_time = creation_time
+        self.age = age
+        self.expired = expired
+        self.client_certificate_required = client_certificate_required
+        self.extended_master_secret = extended_master_secret
+        self.encrypt_then_mac = encrypt_then_mac
+
+    @property
+    def authenticated(self):
+        """Whether the ticket carries a client certificate chain.
+
+        :rtype: bool
+        :returns: ``True`` if the original connection authenticated the
+            client with a certificate, ``False`` for an anonymous ticket
+        """
+        return bool(self.client_cert_chain and
+                    self.client_cert_chain.getNumCerts())
+
+
 class Keypair(object):
     """
     Key, certificate and related data.
@@ -420,6 +509,27 @@ class HandshakeSettings(object):
     :vartype dc_sig_algs: list
     :ivar dc_sig_algs: The supported signature algorithms to be
      used with delegated credential
+
+    :vartype resumption_admission_callback: callable
+    :ivar resumption_admission_callback: Application callback deciding
+        whether a presented session ticket is allowed to resume a
+        connection. ``None`` (the default) preserves the built-in behaviour,
+        i.e. every ticket that decrypts and passes the built-in freshness and
+        consistency checks is accepted.
+
+        The callback is invoked on the server side after a ticket has been
+        successfully decrypted and parsed, but before the resumption is
+        committed (before any resumption ServerHello/Finished is sent), so a
+        rejection can still fall back to a full handshake. It is called with a
+        single :class:`ResumptionTicket` argument describing the identity
+        saved in the ticket (notably its client certificate chain, if any) and
+        the current server configuration. It must return a truthy value to
+        accept the resumption or a falsy value to reject it; a rejected
+        ticket is ignored and the server proceeds with a full handshake. Any
+        exception raised by the callback aborts the handshake with a fatal
+        internal_error alert, it is never treated as an implicit allow.
+        Note that the callback is used only for ticket based resumption;
+        sessions resumed from the server-side session cache are not affected.
     """
 
     def _init_key_settings(self):
@@ -477,6 +587,9 @@ class HandshakeSettings(object):
         # TLS 1.3 RFC9345
         self.dc_sig_algs = []
         self.dc_valid_time = DC_VALID_TIME
+
+        # application policy for session ticket resumption
+        self.resumption_admission_callback = None
 
     def __init__(self):
         """Initialise default values for settings."""
@@ -698,6 +811,10 @@ class HandshakeSettings(object):
             raise ValueError("Delegated credentials cannot be valid for more "
                              "than 7 days.")
 
+        if other.resumption_admission_callback is not None and \
+                not callable(other.resumption_admission_callback):
+            raise ValueError("resumption_admission_callback must be callable")
+
         HandshakeSettings._sanityCheckEMSExtension(other)
 
         if other.certificate_compression_send:
@@ -806,6 +923,8 @@ class HandshakeSettings(object):
             self.certificate_compression_receive
         other.dc_sig_algs = self.dc_sig_algs
         other.dc_valid_time = self.dc_valid_time
+        other.resumption_admission_callback = \
+            self.resumption_admission_callback
 
     @staticmethod
     def _remove_all_matches(values, needle):
